@@ -1290,6 +1290,10 @@ fn write_speaker(
         }
     };
     let mut last_position = Duration::ZERO;
+    // The output's clock also runs while it plays silence before the peer's first frame, so
+    // progress counts only from that frame on: otherwise a stream that has not played a word yet
+    // reads as playing and loses its start-up window to the stall window.
+    let mut first_frame = true;
     let mut quiet_since: Option<Instant> = None;
     while !stop.load(Ordering::Relaxed) {
         let frame = match frames.recv_blocking() {
@@ -1299,6 +1303,10 @@ fn write_speaker(
         };
         if stop.load(Ordering::Relaxed) {
             return;
+        }
+        if first_frame {
+            last_position = sink.position();
+            first_frame = false;
         }
         // Silencing reaches what the player already holds too, not only the frames still to come.
         sink.set_silenced(muted.load(Ordering::Relaxed));
@@ -1419,7 +1427,7 @@ pub(crate) mod fake {
         /// How many blocks this device has played, so a test can tell a restart from a rebind.
         played_count: Arc<AtomicUsize>,
         /// Where the stream says it has played to.
-        played: Arc<Mutex<Duration>>,
+        pub(crate) played: Arc<Mutex<Duration>>,
         /// How long an open is made to take, so a test can hold the pump still while it sends
         /// device selections and prove none of them is dropped.
         pub(crate) open_pause: Arc<AtomicUsize>,
@@ -2085,6 +2093,36 @@ mod tests {
         assert!(speaker.played_count() > before, "the slow device played");
         assert_eq!(opens, 1, "and it played on the stream it started with");
         assert_eq!(stalls, 0, "a slow start is not a stall");
+    }
+
+    /// An output that played silence before the peer's first frame has not played the call yet.
+    ///
+    /// The output's clock runs from the moment it opens, so read against zero the first frame
+    /// already looked played, and a device that then paused got the half-second stall window
+    /// instead of the start-up one, and was torn down with the first words queued behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silence_played_before_the_first_frame_is_not_progress() {
+        let (_devices, speaker) = fake::install(vec![0.0; 8], 1, RATE, (RATE, 1));
+        // A second of silence went out before the peer's first frame, and then the device stops.
+        *speaker
+            .played
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Duration::from_secs(1);
+        speaker.drains.store(false, Ordering::Relaxed);
+        let (output, tx) = AudioOutput::spawn(None, &FarEnd::new());
+        let frame = vec![100_i16; FRAME_SAMPLES];
+        // Past the stall window, inside the start-up one.
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(900) {
+            let _ = tx.try_send(frame.clone());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let opens = output.opens.load(Ordering::Relaxed);
+        drop(output);
+        assert_eq!(
+            opens, 1,
+            "a stream that has not played the call yet keeps its start-up window"
+        );
     }
 
     /// A sink that pauses while a new stream relinks this machine's audio graph is left alone.
