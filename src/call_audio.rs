@@ -517,9 +517,16 @@ impl Sink {
     }
 
     /// How far the stream has played, which is how a stuck device is told from a busy one.
+    ///
+    /// Read from the output's own clock, which counts what the device played and never goes
+    /// backwards. Not `Player::get_pos`: that is the position inside the clip playing now, and
+    /// every engine frame is a clip of its own, so it starts again from zero each 60 ms. Compared
+    /// frame to frame it went backwards whenever the device's clock and the network's drifted
+    /// apart, and a speaker that was playing fine was torn down as stalled every few seconds,
+    /// each time losing half a second of the peer's voice.
     fn position(&self) -> Duration {
         match self {
-            Sink::Real { player, .. } => player.get_pos(),
+            Sink::Real { output, .. } => output.clock().played(),
             #[cfg(test)]
             Sink::Fake(speaker) => speaker.position(),
         }
@@ -1550,6 +1557,42 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the stall check must not read: a player's position is the position inside the clip
+    /// playing now, so it starts again from zero with each frame appended, and a speaker that
+    /// plays without a break still reads as going backwards.
+    #[test]
+    fn a_players_position_starts_again_with_each_frame() {
+        let mixer = rodio::mixer::mixer(
+            NonZero::new(1).expect("one"),
+            NonZero::new(1_000).expect("1 kHz"),
+        );
+        let (controller, mut output) = mixer;
+        let player = rodio::Player::connect_new(&controller);
+        let frame = || {
+            SamplesBuffer::new(
+                NonZero::new(1).expect("one"),
+                NonZero::new(1_000).expect("1 kHz"),
+                vec![0.25_f32; 60],
+            )
+        };
+        player.append(frame());
+        player.append(frame());
+        // Fifty milliseconds into the first frame, then ten into the second.
+        let mut play = |samples: usize| {
+            for _ in 0..samples {
+                let _ = output.next();
+            }
+        };
+        play(50);
+        let in_first = player.get_pos();
+        play(20);
+        let in_second = player.get_pos();
+        assert!(
+            in_second < in_first,
+            "seventy milliseconds in, the position reads {in_second:?}, behind the {in_first:?} it read at fifty"
+        );
+    }
 
     #[test]
     fn mono_mixes_every_channel_in() {
