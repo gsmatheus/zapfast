@@ -3759,18 +3759,38 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32) {
                                         top..=ui.min_rect().bottom(),
                                     )
                                     .expand2(vec2(0.0, ui.spacing().item_spacing.y / 2.0));
+                                    // A voice message's player keeps working, so
+                                    // one can be heard without losing the
+                                    // selection (#1054): over its controls the
+                                    // row only hovers. egui hit-tests against
+                                    // last frame's senses, and the pointer is
+                                    // there before it presses.
+                                    let over_player = ui
+                                        .ctx()
+                                        .data(|data| {
+                                            data.get_temp::<Rect>(player_controls_id(
+                                                &chat.id,
+                                                &message.id,
+                                            ))
+                                        })
+                                        .zip(ui.input(|input| input.pointer.hover_pos()))
+                                        .is_some_and(|(controls, pointer)| {
+                                            controls.contains(pointer)
+                                        });
                                     let pick = ui.interact(
                                         row,
                                         bubble_id(&chat.id, &message.id).with("pick"),
-                                        if selectable {
-                                            Sense::click_and_drag()
-                                        } else {
-                                            Sense::hover()
+                                        match (selectable, over_player) {
+                                            (true, false) => Sense::click_and_drag(),
+                                            // Still focusable, so the keyboard
+                                            // keeps its place on the row.
+                                            (true, true) => Sense::focusable_noninteractive(),
+                                            (false, _) => Sense::hover(),
                                         },
                                     );
                                     let fill = if checked {
                                         palette.accent.gamma_multiply(0.16)
-                                    } else if pick.hovered() {
+                                    } else if pick.hovered() && !over_player {
                                         palette.text.gamma_multiply(0.05)
                                     } else {
                                         Color32::TRANSPARENT
@@ -5367,6 +5387,12 @@ pub fn messages_list_id(chat: &str) -> egui::Id {
 }
 
 /// Stable message-bubble id used by interaction tests.
+/// Where a voice or audio player keeps the rect around its controls this
+/// frame, so a selecting row leaves them their clicks and drags (#1054).
+fn player_controls_id(chat: &str, message: &str) -> egui::Id {
+    bubble_id(chat, message).with("player-controls")
+}
+
 pub fn bubble_id(chat: &str, message: &str) -> egui::Id {
     egui::Id::new(("bubble", chat, message))
 }
@@ -11312,6 +11338,9 @@ fn voice_player(
     };
     // Force left-to-right layout at the player's width inside own bubbles.
     let mut duration = None;
+    // The play button, waveform and speed chip, which keep their clicks
+    // while messages are being selected (#1054).
+    let mut controls = Rect::NOTHING;
     let row = ui.allocate_ui_with_layout(
         vec2(width.max(0.0), button),
         Layout::left_to_right(Align::Center),
@@ -11347,7 +11376,7 @@ fn voice_player(
                         } else {
                             (Icon::Play, "Play")
                         };
-                        if theme::circle_button(
+                        let response = theme::circle_button(
                             ui,
                             icon,
                             button,
@@ -11355,9 +11384,9 @@ fn voice_player(
                             hover,
                             palette.accent,
                             tooltip,
-                        )
-                        .clicked()
-                        {
+                        );
+                        controls = controls.union(response.rect);
+                        if response.clicked() {
                             actions.push(Action::PlayVoice {
                                 message: message.id.clone(),
                                 path: path.clone(),
@@ -11430,6 +11459,7 @@ fn voice_player(
                     );
                 }
                 if let Some(path) = &media.path {
+                    controls = controls.union(rect);
                     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
                     if response.clicked()
                         && let Some(pointer) = response.interact_pointer_pos()
@@ -11531,6 +11561,7 @@ fn voice_player(
                 ui.ctx().data_mut(|data| {
                     data.insert_temp(speed_chip_id(&view.chat.id, &message.id), response.rect);
                 });
+                controls = controls.union(response.rect);
                 if response.clicked() {
                     actions.push(speed_action(
                         view.chat,
@@ -11545,6 +11576,11 @@ fn voice_player(
             }
         },
     );
+    if controls.is_positive() {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(player_controls_id(&view.chat.id, &message.id), controls);
+        });
+    }
     let auto = media.path.is_none()
         && matches!(media.state, MediaState::Idle)
         && view.auto_download
