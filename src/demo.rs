@@ -16045,6 +16045,70 @@ mod tests {
         assert_eq!(selected(&app), ["ada-doc", "ada-voice"]);
     }
 
+    /// #1054: while selecting, a voice message's play button and waveform
+    /// keep their clicks, so one can be heard without losing the selection,
+    /// and the rest of its row still picks it.
+    #[test]
+    fn while_selecting_a_voice_message_still_plays() {
+        let mut app = app();
+        apply_flags(&mut app, Some("voice"));
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        for _ in 0..3 {
+            render(&mut app, &ctx);
+        }
+        let chat = sample_ids()[0].to_owned();
+        app.actions
+            .push(crate::model::Action::SelectMessage("ada-doc".into()));
+        render(&mut app, &ctx);
+        let rect = |message: &str, part: &str| {
+            let id = crate::ui::conversation::bubble_id(&chat, message).with(part);
+            ctx.data(|data| data.get_temp::<egui::Rect>(id))
+                .unwrap_or_else(|| panic!("{message} is on screen"))
+        };
+        // The pointer arrives before it presses, as a mouse does.
+        let click = |app: &mut App, pos: egui::Pos2| {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame_with(app, &ctx, vec![egui::Event::PointerMoved(pos)]);
+            frame_with(app, &ctx, vec![button(true)]);
+            frame_with(app, &ctx, vec![button(false)]);
+            render(app, &ctx);
+        };
+        let selected = |app: &App| {
+            app.selection
+                .as_ref()
+                .map(|(_, ids)| ids.clone())
+                .unwrap_or_default()
+        };
+        let controls = rect("ada-voice", "player-controls");
+        let play = egui::pos2(controls.left() + 18.0, controls.center().y);
+        click(&mut app, play);
+        assert_ne!(
+            app.player.status("ada-voice").state,
+            crate::audio::State::Idle,
+            "the play button plays"
+        );
+        assert_eq!(selected(&app), ["ada-doc"], "playing selects nothing");
+        app.player.stop();
+        click(&mut app, rect("ada-voice", "voice-waveform").center());
+        assert_ne!(
+            app.player.status("ada-voice").state,
+            crate::audio::State::Idle,
+            "the waveform seeks"
+        );
+        assert_eq!(selected(&app), ["ada-doc"], "seeking selects nothing");
+        app.player.stop();
+        // Beside the player the row still picks the message.
+        let voice = rect("ada-voice", "rect");
+        click(&mut app, egui::pos2(voice.right() + 60.0, voice.center().y));
+        assert_eq!(selected(&app), ["ada-doc", "ada-voice"]);
+    }
+
     /// While selecting, as in WhatsApp Web, every row has a check box in a
     /// column on the left, the whole width of the row picks it, and the
     /// selection stays open with nothing in it.
